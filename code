@@ -1,0 +1,236 @@
+/***************************************
+ * CONFIGURAÇÕES
+ ***************************************/
+const NOTION_TOKEN = "COLE_O_SEU_TOKEN_AQUI";
+const DB_MAIN = "2509c39c40488022ad5ce7b956340182";
+const DB_REGISTRO = "2519c39c404880098f15d467a6e3b5d2";
+const NOTION_VERSION = "2022-06-28";
+
+// Endereço para web scraping
+const SCRAPING_FULL_LIST_URL = "https://www.dbs-cardgame.com/fw/en/cardlist/";
+
+/***************************************
+ * FUNÇÃO PRINCIPAL
+ ***************************************/
+function processarRegistros() {
+  const registros = buscarRegistrosPendentes();
+
+  if (registros.length === 0) {
+    Logger.log("Nenhum registro pendente encontrado.");
+    return;
+  }
+  
+  Logger.log(`Iniciando o processamento de ${registros.length} registros.`);
+
+  registros.forEach(registro => {
+    try {
+      const props = {
+        pageId: registro.id,
+        cartaId: registro.properties["ID"]?.title[0]?.plain_text,
+        quantidade: registro.properties["Quantidade"]?.number
+      };
+      
+      if (!props.cartaId) {
+        Logger.log(`🚨 Registro sem ID da carta encontrado. Pulando... (ID: ${props.pageId})`);
+        return;
+      }
+      
+      atualizarBancoPrincipal(props);
+      
+      marcarComoProcessado(props.pageId);
+      
+      Logger.log(`✅ Processado: ${props.cartaId}`);
+      
+    } catch (e) {
+      Logger.log(`❌ Erro ao processar registro (ID: ${registro.id}): ${e.message}`);
+    }
+  });
+}
+
+/***************************************
+ * BUSCAR DADOS DA CARTA (WEB SCRAPING)
+ ***************************************/
+function buscarDadosDaCarta(cardId) {
+  try {
+    const htmlCompleto = UrlFetchApp.fetch(SCRAPING_FULL_LIST_URL).getContentText();
+    
+    // O site usa a imagem da carta para linkar a página de detalhes
+    const cardRegex = new RegExp(`<a href="(/fw/en/cardlist/card.php\\?cardno=${cardId})"[^>]*><img[^>]*></a>`);
+    const cardLinkMatch = htmlCompleto.match(cardRegex);
+    
+    if (!cardLinkMatch || !cardLinkMatch[1]) {
+      Logger.log(`❌ Link da carta ${cardId} não encontrado na lista completa.`);
+      return null;
+    }
+    
+    const urlDaCarta = `https://www.dbs-cardgame.com${cardLinkMatch[1]}`;
+    Logger.log(`  🔍 Link da carta encontrado: ${urlDaCarta}`);
+    
+    const htmlDaCarta = UrlFetchApp.fetch(urlDaCarta).getContentText();
+
+    // Extração do Nome da Carta
+    const nomeRegex = new RegExp(`h1 class="card-name-en"[^>]*>([^<]*)<`);
+    const nome = htmlDaCarta.match(nomeRegex)?.[1]?.trim() || "";
+
+    // Extração de outras propriedades
+    const detalhes = {};
+    const detalhesRegex = /<dd class="card-spec-item__text[^>]*>([^<]*)<\/dd>/g;
+    const matches = htmlDaCarta.matchAll(detalhesRegex);
+    let i = 0;
+    for (const match of matches) {
+      if (i === 0) detalhes.color = [match[1].trim()];
+      else if (i === 1) detalhes.rarity = match[1].trim();
+      else if (i === 2) detalhes.card_type = match[1].trim();
+      else if (i === 3) detalhes.cost = Number(match[1].trim());
+      else if (i === 4) detalhes.product_set = match[1].trim();
+      else if (i === 5) detalhes.features = match[1].split('/').map(f => f.trim()).filter(f => f);
+      i++;
+    }
+
+    if (!nome || !detalhes.rarity) {
+      Logger.log(`❌ Não foi possível extrair os dados da carta ${cardId}.`);
+      return null;
+    }
+    
+    Logger.log(`  ✅ Dados da carta ${cardId} extraídos com sucesso.`);
+    return { name: nome, ...detalhes };
+    
+  } catch (e) {
+      Logger.log(`❌ Falha no web scraping: ${e.message}`);
+    return null;
+  }
+}
+
+/***************************************
+ * ATUALIZAR BANCO PRINCIPAL
+ ***************************************/
+function atualizarBancoPrincipal(registro) {
+  const cartaId = registro.cartaId;
+  const delta = registro.quantidade || 0;
+
+  const page = encontrarCartaNoDBMain(cartaId);
+
+  if (page) {
+    const pageId = page.id;
+    const atual = page.properties?.["Cópias"]?.number ?? 0;
+    const nova = Number(atual) + Number(delta);
+    
+    Logger.log(`  🔎 ${cartaId} encontrado. Atualizando quantidade de ${atual} para ${nova}.`);
+    patchPagina(pageId, { "Cópias": { "number": nova } });
+    
+    return;
+  }
+
+  Logger.log(`  🆕 ${cartaId} não encontrado. Buscando detalhes via web scraping...`);
+  const dadosDaCarta = buscarDadosDaCarta(cartaId);
+  
+  if (dadosDaCarta) {
+    Logger.log(`  ✅ Criando nova carta com ${delta} cópias e detalhes do site.`);
+    criarCartaNoDBMain(cartaId, delta, dadosDaCarta);
+  } else {
+    Logger.log(`  🚨 Web scraping falhou. Criando carta apenas com ID e Cópias.`);
+    criarCartaNoDBMain(cartaId, delta, null);
+  }
+}
+
+/***************************************
+ * OUTRAS FUNÇÕES (SEM ALTERAÇÃO)
+ ***************************************/
+function encontrarCartaNoDBMain(cartaId) {
+  const url = `https://api.notion.com/v1/databases/${DB_MAIN}/query`;
+  const options = {
+    method: "post",
+    headers: {
+      "Authorization": `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      "filter": {
+        "property": "ID", 
+        "rich_text": { "equals": cartaId }
+      },
+      "page_size": 1
+    })
+  };
+  const resp = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(resp.getContentText());
+  return (data.results && data.results[0]) ? data.results[0] : null;
+}
+
+function criarCartaNoDBMain(cartaId, quantidade, dadosDaCarta) {
+  const url = "https://api.notion.com/v1/pages";
+  const props = {
+    "ID": { "rich_text": [{ "text": { "content": cartaId } }] },
+    "Cópias": { "number": Number(quantidade) || 0 }
+  };
+  
+  if (dadosDaCarta) {
+    props["Nome"] = { "title": [{ "text": { "content": dadosDaCarta.name } }] };
+    props["Cor"] = { "select": { "name": dadosDaCarta.color[0] } };
+    props["Coleção"] = { "select": { "name": dadosDaCarta.product_set } };
+    props["Raridade"] = { "select": { "name": dadosDaCarta.rarity } };
+    props["Card type"] = { "select": { "name": dadosDaCarta.card_type } };
+    props["Features"] = { "multi_select": dadosDaCarta.features.map(feature => ({ name: feature })) };
+    props["Cost"] = { "number": dadosDaCarta.cost };
+  }
+  
+  const options = {
+    method: "post",
+    headers: {
+      "Authorization": `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      parent: { database_id: DB_MAIN },
+      properties: props
+    })
+  };
+
+  UrlFetchApp.fetch(url, options);
+}
+
+function patchPagina(pageId, props) {
+  const url = `https://api.notion.com/v1/pages/${pageId}`;
+  const options = {
+    method: "patch",
+    headers: {
+      "Authorization": `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({ properties: props })
+  };
+  UrlFetchApp.fetch(url, options);
+}
+
+function marcarComoProcessado(pageId) {
+  const props = { "Status": { "select": { "name": "Processado" } } };
+  try {
+    patchPagina(pageId, props);
+  } catch (e) {
+    Logger.log(`Falha ao marcar como 'Processado' (ID: ${pageId}): ${e.message}`);
+  }
+}
+
+function buscarRegistrosPendentes() {
+  const url = `https://api.notion.com/v1/databases/${DB_REGISTRO}/query`;
+  const options = {
+    method: "post",
+    headers: {
+      "Authorization": `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      "filter": {
+        "property": "Status",
+        "select": { "equals": "Pendente" }
+      }
+    })
+  };
+  const response = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(response.getContentText());
+  return data.results;
+}
